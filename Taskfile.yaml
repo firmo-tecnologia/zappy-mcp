@@ -1,0 +1,19 @@
+version: '3'
+tasks:
+  build:
+    desc: Build the local Zappy MCP companion
+    cmds:
+      - go build -o bin/zappy-mcp ./cmd/zappy-mcp
+  install:
+    desc: Install zappy-mcp into the Go binary directory
+    cmds:
+      - go install ./cmd/zappy-mcp
+  check:
+    desc: Compile and vet the MCP companion
+    cmds:
+      - go build ./...
+      - go vet ./...
+  downloads:
+    desc: Build binary archives and checksums in dist/
+    cmds:
+      - bash scripts/build-downloads.sh
