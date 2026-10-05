@@ -1,7 +1,7 @@
 # Zappy MCP
 
 Componente local para Claude Code e Codex, usando o SDK oficial MCP Go v1.8.0
-(MCP 2026-07-28, com compatibilidade negociada para as versões anteriores).
+(MCP 2026-07-28).
 
 O processo local faz OAuth Authorization Code + PKCE S256, coleta eventos da API
 pela mesma sessão de saída autenticada do zappy-webhook-listener e mantém JSON
@@ -80,11 +80,6 @@ vazio até que o nome esteja disponível.
 Use esse argumento em `query_whatsapp_messages` para consultar uma conversa
 exata, inclusive grupos. Consultas por nome também usam o índice de identidades.
 As consultas ficam limitadas às instâncias da conta selecionada.
-
-Ao iniciar a nova versão, o histórico antigo da conta é migrado automaticamente.
-O arquivo original é preservado como `messages.json.migrated`. Feche os processos
-da versão anterior antes da atualização e reinicie os clientes MCP para evitar
-que continuem escrevendo no formato antigo.
 
 No Linux e macOS, diretórios têm permissão 0700 e arquivos privados 0600.
 No Windows, a proteção depende das ACLs do perfil do usuário. As escritas usam arquivo
