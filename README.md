@@ -47,7 +47,7 @@ backoff em falhas. Cada frame é validado com HMAC antes de salvar.
 | Ferramenta | Comportamento |
 | --- | --- |
 | `send_whatsapp_message` | `to`, `message`, `instance_id` opcional se houver uma única instância conectada; envia e grava o resultado. |
-| `query_whatsapp_messages` | `number` e/ou `contact`; filtros `instance_id`, `direction`, `after`; `limit` 1–200 e `offset`; retorna newest first e status da coleta. |
+| `query_whatsapp_messages` | `number`, `contact` e/ou `jid` (inclusive grupos); filtros `instance_id`, `direction`, `after`; `limit` 1–200 e `offset`; retorna newest first e status da coleta. |
 | `list_whatsapp_instances` | Lista as instâncias da conta autenticada. |
 
 A consulta por número usa correspondência exata após normalização. Nomes usam
@@ -56,13 +56,35 @@ A consulta por contato inclui mensagens enviadas para os números identificados.
 JIDs `@lid` não são tratados como números; os campos `sender_pn` e `recipient_pn`
 são usados quando disponíveis.
 
-Dados por conta:
+Histórico por instância e conversa:
 
-- `~/.zappy/mcp/accounts/<account-id>/messages.json`: array JSON persistente.
-- `oauth.json`: tokens; nunca compartilhe esse arquivo.
-- `listener.json`: estado e horário da coleta por instância.
+- `~/.zappy/mcp/instances/<instance-id>/<jid>.json`: array JSON de mensagens da conversa.
+- `~/.zappy/mcp/meta.json`: dicionário de JID para `number`, `name`, `is_group` e `instances` (instância → conta proprietária).
+- `~/.zappy/mcp/accounts/<account-id>/oauth.json`: tokens; nunca compartilhe esse arquivo.
+- `~/.zappy/mcp/accounts/<account-id>/listener.json`: estado e horário da coleta.
 - `*.lock`: bloqueios de arquivo entre processos.
 - `~/.zappy/mcp/current-account.json`: última conta usada.
+
+Exemplo: `instances/UUID/5521990251186@s.whatsapp.net.json`.
+Grupos usam seu JID `@g.us`; contatos podem usar `@lid`. O índice associa
+esses JIDs ao número e nome quando disponíveis. Grupos não têm número de telefone.
+O nome do remetente (`contact`) e seu JID (`sender`) ficam em cada mensagem;
+o nome do participante nunca é usado como nome do grupo. O evento atual da API
+não informa o nome do grupo: ele permanece identificável pelo JID, com `name`
+vazio até que o nome esteja disponível.
+
+```json
+{"jid":"120363000000000000@g.us","instance_id":"UUID","limit":50}
+```
+
+Use esse argumento em `query_whatsapp_messages` para consultar uma conversa
+exata, inclusive grupos. Consultas por nome também usam o índice de identidades.
+As consultas ficam limitadas às instâncias da conta selecionada.
+
+Ao iniciar a nova versão, o histórico antigo da conta é migrado automaticamente.
+O arquivo original é preservado como `messages.json.migrated`. Feche os processos
+da versão anterior antes da atualização e reinicie os clientes MCP para evitar
+que continuem escrevendo no formato antigo.
 
 No Linux e macOS, diretórios têm permissão 0700 e arquivos privados 0600.
 No Windows, a proteção depende das ACLs do perfil do usuário. As escritas usam arquivo
@@ -76,8 +98,8 @@ Use `--account UUID` para selecionar uma conta já autorizada.
 O listener coleta enquanto conectado; não busca histórico anterior nem recupera
 eventos perdidos durante uma indisponibilidade. O hub da API permanece em memória,
 como o listener existente; múltiplas réplicas precisam de afinidade ou de um
-transporte compartilhado. A consulta não apaga mensagens. O arquivo cresce com o
-histórico e é regravado a cada atualização.
+transporte compartilhado. A consulta não apaga mensagens. Cada arquivo de conversa cresce com seu
+histórico e é regravado quando recebe uma atualização.
 
 Não há repetição automática de envio. Se a mensagem for enviada e a escrita local
 falhar, a ferramenta retorna sucesso com `saved_locally: false` e uma advertência,

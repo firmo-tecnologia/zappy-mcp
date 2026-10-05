@@ -14,19 +14,29 @@ import (
 )
 
 type Message struct {
-	ID         string          `json:"id"`
-	InstanceID string          `json:"instance_id"`
-	Chat       string          `json:"chat"`
-	Number     string          `json:"number,omitempty"`
-	Contact    string          `json:"contact,omitempty"`
-	Direction  string          `json:"direction"`
-	Type       string          `json:"type"`
-	Text       string          `json:"text,omitempty"`
-	Timestamp  time.Time       `json:"timestamp"`
-	Payload    json.RawMessage `json:"payload,omitempty"`
+	ID               string          `json:"id"`
+	InstanceID       string          `json:"instance_id"`
+	Sender           string          `json:"sender,omitempty"`
+	ConversationName string          `json:"conversation_name,omitempty"`
+	Chat             string          `json:"chat"`
+	Number           string          `json:"number,omitempty"`
+	Contact          string          `json:"contact,omitempty"`
+	Direction        string          `json:"direction"`
+	Type             string          `json:"type"`
+	Text             string          `json:"text,omitempty"`
+	Timestamp        time.Time       `json:"timestamp"`
+	Payload          json.RawMessage `json:"payload,omitempty"`
 }
-type Store struct{ Dir string }
+type Identity struct {
+	Number  string `json:"number"`
+	Name    string `json:"name"`
+	IsGroup bool   `json:"is_group"`
+	// Instance ownership keeps queries isolated after switching OAuth accounts.
+	Instances map[string]string `json:"instances"`
+}
+type Store struct{ Dir, Root, AccountID string }
 type QueryInput struct {
+	JID        string `json:"jid,omitempty" jsonschema:"Exact conversation JID, including groups (@g.us) and contacts (@lid)"`
 	Number     string `json:"number,omitempty" jsonschema:"Exact phone number with country code; use number or contact"`
 	Contact    string `json:"contact,omitempty" jsonschema:"Case-insensitive contact display name; may match multiple people"`
 	InstanceID string `json:"instance_id,omitempty" jsonschema:"Optional WhatsApp instance filter"`
@@ -36,12 +46,13 @@ type QueryInput struct {
 	Offset     int    `json:"offset,omitempty" jsonschema:"Pagination offset; newest messages first"`
 }
 type QueryOutput struct {
-	Messages    []Message       `json:"messages"`
-	Total       int             `json:"total"`
-	HasMore     bool            `json:"has_more"`
-	NextOffset  int             `json:"next_offset"`
-	HistoryPath string          `json:"history_path"`
-	Listener    json.RawMessage `json:"listener,omitempty"`
+	Messages     []Message       `json:"messages"`
+	Total        int             `json:"total"`
+	HasMore      bool            `json:"has_more"`
+	NextOffset   int             `json:"next_offset"`
+	MetadataPath string          `json:"metadata_path"`
+	HistoryPath  string          `json:"history_path"`
+	Listener     json.RawMessage `json:"listener,omitempty"`
 }
 
 func NewStore(root, accountID string) (*Store, error) {
@@ -52,13 +63,69 @@ func NewStore(root, accountID string) (*Store, error) {
 	if err := privateDir(dir); err != nil {
 		return nil, err
 	}
-	return &Store{Dir: dir}, nil
+	store := &Store{Dir: dir, Root: root, AccountID: accountID}
+	lock, err := lockFile(context.Background(), filepath.Join(root, "history.lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Unlock()
+	legacy := filepath.Join(dir, "messages.json")
+	var messages []Message
+	if err := readJSON(legacy, &messages); err == nil {
+		if messages == nil {
+			return nil, errors.New("legacy history must be a JSON array (file preserved)")
+		}
+		for _, message := range messages {
+			if len(message.Payload) != 0 {
+				if decoded, err := decodeEvent(message.Payload, message.InstanceID, accountID); err == nil {
+					message.Sender = decoded.Sender
+					message.ConversationName = decoded.ConversationName
+				}
+			}
+			if err := store.save(message); err != nil {
+				return nil, err
+			}
+		}
+		if err := os.Rename(legacy, legacy+".migrated"); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return store, nil
 }
-func (s *Store) HistoryPath() string { return filepath.Join(s.Dir, "messages.json") }
-
-func (s *Store) read() ([]Message, error) {
+func (s *Store) HistoryPath() string { return filepath.Join(s.Root, "instances") }
+func validJID(jid string) bool {
+	parts := strings.Split(jid, "@")
+	if len(jid) > 200 || len(parts) != 2 || parts[0] == "" {
+		return false
+	}
+	switch parts[1] {
+	case "s.whatsapp.net", "c.us", "lid", "g.us", "broadcast":
+	default:
+		return false
+	}
+	for _, c := range parts[0] {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+func (s *Store) metadata() (map[string]Identity, error) {
+	meta := map[string]Identity{}
+	err := readJSON(filepath.Join(s.Root, "meta.json"), &meta)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]Identity{}, nil
+	}
+	if meta == nil && err == nil {
+		return nil, errors.New("metadata must be a JSON object (file preserved)")
+	}
+	return meta, err
+}
+func readMessages(path string) ([]Message, error) {
 	messages := []Message{}
-	err := readJSON(s.HistoryPath(), &messages)
+	err := readJSON(path, &messages)
 	if errors.Is(err, os.ErrNotExist) {
 		return messages, nil
 	}
@@ -67,16 +134,101 @@ func (s *Store) read() ([]Message, error) {
 	}
 	return messages, err
 }
-func (s *Store) Save(ctx context.Context, message Message) error {
-	if message.ID == "" || !validUUID(message.InstanceID) {
-		return errors.New("message ID and valid instance ID are required")
+func (s *Store) read() ([]Message, error) {
+	meta, err := s.metadata()
+	if err != nil {
+		return nil, err
 	}
-	lock, err := lockFile(ctx, filepath.Join(s.Dir, "messages.lock"))
+	messages := []Message{}
+	for jid, identity := range meta {
+		if !validJID(jid) {
+			return nil, errors.New("invalid conversation JID in metadata")
+		}
+		for instance, account := range identity.Instances {
+			if account != s.AccountID {
+				continue
+			}
+			if !validUUID(instance) {
+				return nil, errors.New("invalid instance in metadata")
+			}
+			rows, err := readMessages(filepath.Join(s.HistoryPath(), instance, jid+".json"))
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, rows...)
+		}
+	}
+	return messages, nil
+}
+func (s *Store) Save(ctx context.Context, message Message) error {
+	lock, err := lockFile(ctx, filepath.Join(s.Root, "history.lock"))
 	if err != nil {
 		return err
 	}
 	defer lock.Unlock()
-	messages, err := s.read()
+	return s.save(message)
+}
+func (s *Store) save(message Message) error {
+	if message.ID == "" || !validUUID(message.InstanceID) || !validJID(message.Chat) {
+		return errors.New("message ID, valid instance ID and conversation JID are required")
+	}
+	meta, err := s.metadata()
+	if err != nil {
+		return err
+	}
+	identity := meta[message.Chat]
+	if identity.Instances == nil {
+		identity.Instances = map[string]string{}
+	}
+	if owner := identity.Instances[message.InstanceID]; owner != "" && owner != s.AccountID {
+		return errors.New("instance belongs to a different account")
+	}
+	identity.Instances[message.InstanceID] = s.AccountID
+	identity.IsGroup = strings.HasSuffix(message.Chat, "@g.us")
+	if message.ConversationName != "" {
+		identity.Name = message.ConversationName
+	}
+	if !identity.IsGroup {
+		if message.Number != "" {
+			identity.Number = message.Number
+		}
+		if message.Contact != "" {
+			identity.Name = message.Contact
+		}
+	}
+	meta[message.Chat] = identity
+	// Register ownership first: a crash before the history write leaves only an empty conversation.
+	if err := writeJSON(filepath.Join(s.Root, "meta.json"), meta); err != nil {
+		return err
+	}
+	if message.Direction == "inbound" && message.Sender != "" && validJID(message.Sender) && message.Sender != message.Chat {
+		sender := meta[message.Sender]
+		if sender.Instances == nil {
+			sender.Instances = map[string]string{}
+		}
+		if owner := sender.Instances[message.InstanceID]; owner != "" && owner != s.AccountID {
+			return errors.New("sender instance belongs to a different account")
+		}
+		sender.Instances[message.InstanceID] = s.AccountID
+		if message.Number != "" {
+			sender.Number = message.Number
+		}
+		if message.Contact != "" {
+			sender.Name = message.Contact
+		}
+		meta[message.Sender] = sender
+		if err := writeJSON(filepath.Join(s.Root, "meta.json"), meta); err != nil {
+			return err
+		}
+	}
+	if err := privateDir(s.HistoryPath()); err != nil {
+		return err
+	}
+	if err := privateDir(filepath.Join(s.HistoryPath(), message.InstanceID)); err != nil {
+		return err
+	}
+	path := filepath.Join(s.HistoryPath(), message.InstanceID, message.Chat+".json")
+	messages, err := readMessages(path)
 	if err != nil {
 		return err
 	}
@@ -84,6 +236,12 @@ func (s *Store) Save(ctx context.Context, message Message) error {
 		if existing.ID == message.ID && existing.InstanceID == message.InstanceID {
 			// Enrich outgoing events with a later WhatsApp echo; never lose the
 			// contact name or timestamp when a less complete duplicate arrives.
+			if message.Sender == "" {
+				message.Sender = existing.Sender
+			}
+			if message.ConversationName == "" {
+				message.ConversationName = existing.ConversationName
+			}
 			if message.Contact == "" {
 				message.Contact = existing.Contact
 			}
@@ -100,17 +258,20 @@ func (s *Store) Save(ctx context.Context, message Message) error {
 				message.Timestamp = existing.Timestamp
 			}
 			messages[i] = message
-			return writeJSON(s.HistoryPath(), messages)
+			return writeJSON(path, messages)
 		}
 	}
 	messages = append(messages, message)
-	return writeJSON(s.HistoryPath(), messages)
+	return writeJSON(path, messages)
 }
 
 func (s *Store) Query(ctx context.Context, input QueryInput) (QueryOutput, error) {
-	output := QueryOutput{Messages: []Message{}, HistoryPath: s.HistoryPath()}
-	if strings.TrimSpace(input.Number) == "" && strings.TrimSpace(input.Contact) == "" {
-		return output, fmt.Errorf("number or contact is required")
+	output := QueryOutput{Messages: []Message{}, HistoryPath: s.HistoryPath(), MetadataPath: filepath.Join(s.Root, "meta.json")}
+	if strings.TrimSpace(input.Number) == "" && strings.TrimSpace(input.Contact) == "" && input.JID == "" {
+		return output, fmt.Errorf("number, contact or jid is required")
+	}
+	if input.JID != "" && !validJID(input.JID) {
+		return output, fmt.Errorf("invalid jid")
 	}
 	if input.Limit == 0 {
 		input.Limit = 50
@@ -136,7 +297,7 @@ func (s *Store) Query(ctx context.Context, input QueryInput) (QueryOutput, error
 	if input.Number != "" && number == "" {
 		return output, fmt.Errorf("number must contain a valid phone number")
 	}
-	lock, err := lockFile(ctx, filepath.Join(s.Dir, "messages.lock"))
+	lock, err := lockFile(ctx, filepath.Join(s.Root, "history.lock"))
 	if err != nil {
 		return output, err
 	}
@@ -145,23 +306,33 @@ func (s *Store) Query(ctx context.Context, input QueryInput) (QueryOutput, error
 	if err != nil {
 		return output, err
 	}
+	meta, err := s.metadata()
+	if err != nil {
+		return output, err
+	}
 	contact := strings.ToLower(strings.TrimSpace(input.Contact))
 	// A contact query includes outgoing messages to the same number even when
 	// outbound events have no push_name. Names are not unique across accounts.
 	contactNumbers := map[string]bool{}
+	contactChats := map[string]bool{}
 	if contact != "" {
 		for _, message := range messages {
 			if message.Number != "" && strings.Contains(strings.ToLower(message.Contact), contact) {
 				contactNumbers[message.InstanceID+":"+message.Number] = true
+				contactChats[message.InstanceID+":"+message.Chat] = true
 			}
 		}
 	}
 	matches := []Message{}
 	for _, message := range messages {
-		if number != "" && message.Number != number {
+		if input.JID != "" && message.Chat != input.JID {
 			continue
 		}
-		if contact != "" && !strings.Contains(strings.ToLower(message.Contact), contact) && !contactNumbers[message.InstanceID+":"+message.Number] {
+		identity := meta[message.Chat]
+		if number != "" && message.Number != number && identity.Number != number {
+			continue
+		}
+		if contact != "" && !strings.Contains(strings.ToLower(message.Contact), contact) && !contactNumbers[message.InstanceID+":"+message.Number] && !contactChats[message.InstanceID+":"+message.Chat] && !strings.Contains(strings.ToLower(identity.Name), contact) {
 			continue
 		}
 		if input.InstanceID != "" && message.InstanceID != input.InstanceID {
@@ -230,6 +401,7 @@ func decodeEvent(body []byte, expectedInstance, accountID string) (Message, erro
 				From        string    `json:"from"`
 				Chat        string    `json:"chat"`
 				Contact     string    `json:"push_name"`
+				GroupName   string    `json:"group_name"`
 				SenderPN    string    `json:"sender_pn"`
 				RecipientPN string    `json:"recipient_pn"`
 				Timestamp   time.Time `json:"timestamp"`
@@ -257,6 +429,8 @@ func decodeEvent(body []byte, expectedInstance, accountID string) (Message, erro
 		message.Direction, message.Type, message.Text = "outbound", p.Type, p.Content
 	case "message.received":
 		m := p.Message
+		message.Sender = m.From
+		message.ConversationName = m.GroupName
 		message.ID, message.Chat, message.Type, message.Text = m.ID, m.Chat, m.Type, m.Text
 		if message.Text == "" {
 			message.Text = m.Caption
